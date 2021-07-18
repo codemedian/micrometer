@@ -1,5 +1,5 @@
 /**
- * Copyright 2019 VMware, Inc.
+ * Copyright 2021 VMware, Inc.
  * <p>
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,14 +13,16 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 package io.micrometer.dynatrace;
 
-class DynatraceBatchedPayload {
-    final String payload;
-    final int metricCount;
-
-    DynatraceBatchedPayload(String payload, int metricCount) {
-        this.payload = payload;
-        this.metricCount = metricCount;
-    }
+/**
+ * An enum containing valid Dynatrace API versions.
+ *
+ * @author Georg Pirklbauer
+ * @since 1.8.0
+ */
+public enum DynatraceApiVersion {
+    V1,
+    V2
 }

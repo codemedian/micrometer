@@ -2,11 +2,12 @@ def VERSIONS = [
         'ch.qos.logback:logback-classic:1.2.+',
         'colt:colt:1.2.0',
         'com.amazonaws:aws-java-sdk-cloudwatch:latest.release',
-        'com.fasterxml.jackson.core:jackson-databind:latest.release',
+        'com.dynatrace.metric.util:dynatrace-metric-utils-java:1.1.+',
+        'com.fasterxml.jackson.core:jackson-databind:2.12.+',
         'com.github.ben-manes.caffeine:caffeine:2.+',
         'com.github.charithe:kafka-junit:latest.release',
         'com.github.tomakehurst:wiremock-jre8-standalone:latest.release',
-        'com.google.cloud:google-cloud-monitoring:1.+',
+        'com.google.cloud:google-cloud-monitoring:latest.release',
         'com.google.dagger:dagger:2.11',
         'com.google.dagger:dagger-compiler:2.11',
         'com.google.guava:guava:latest.release',
@@ -34,9 +35,6 @@ def VERSIONS = [
         'io.grpc:grpc-stubs:latest.release',
         'io.grpc:grpc-alts:latest.release',
         'info.ganglia.gmetric4j:gmetric4j:latest.release',
-        'io.projectreactor:reactor-core:3.3.+',
-        'io.projectreactor:reactor-test:3.3.+',
-        'io.projectreactor.netty:reactor-netty:0.9.+',
         'io.prometheus:simpleclient_common:latest.release',
         'io.prometheus:simpleclient_pushgateway:latest.release',
         'javax.cache:cache-api:latest.release',
@@ -93,6 +91,7 @@ subprojects {
           runtimeOnly version
         }
       }
+      implementation platform('io.projectreactor:reactor-bom:2020.0.+')
     }
   }
 }
