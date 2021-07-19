@@ -15,12 +15,18 @@
  */
 package io.micrometer.cloudwatch2;
 
+import io.micrometer.cloudwatch2.highres.CloudWatchHighResMetric;
+import io.micrometer.cloudwatch2.highres.CloudWatchHighResolutionFunctionTimer;
+import io.micrometer.cloudwatch2.highres.CloudWatchHighResolutionLongTaskTimer;
+import io.micrometer.cloudwatch2.highres.CloudWatchHighResolutionTimer;
 import io.micrometer.core.instrument.Tag;
 import io.micrometer.core.instrument.Timer;
 import io.micrometer.core.instrument.*;
 import io.micrometer.core.instrument.distribution.DistributionStatisticConfig;
 import io.micrometer.core.instrument.distribution.HistogramGauges;
 import io.micrometer.core.instrument.distribution.pause.PauseDetector;
+import io.micrometer.core.instrument.internal.DefaultMeter;
+import io.micrometer.core.instrument.noop.NoopDistributionSummary;
 import io.micrometer.core.instrument.step.StepMeterRegistry;
 import io.micrometer.core.instrument.util.NamedThreadFactory;
 import io.micrometer.core.instrument.util.StringUtils;
@@ -35,9 +41,14 @@ import software.amazon.awssdk.services.cloudwatch.model.*;
 
 import java.time.Instant;
 import java.util.*;
+import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
+import java.util.function.Function;
+import java.util.function.ToDoubleFunction;
+import java.util.function.ToLongFunction;
 import java.util.stream.Stream;
 
 import static java.util.stream.Collectors.toList;
@@ -53,7 +64,8 @@ import static java.util.stream.StreamSupport.stream;
  * @since 1.2.0
  */
 public class CloudWatchMeterRegistry extends StepMeterRegistry {
-
+    private static final int MAX_VALUES_PER_DATUM = 150;
+    private static final Integer HIGH_RESOLUTION = 1;
     private static final Map<String, StandardUnit> STANDARD_UNIT_BY_LOWERCASE_VALUE;
 
     static {
@@ -81,6 +93,14 @@ public class CloudWatchMeterRegistry extends StepMeterRegistry {
         super(config, clock);
         this.cloudWatchAsyncClient = cloudWatchAsyncClient;
         this.config = config;
+
+
+        if (config.highResolution()) {
+            if (config.useStatisticsSet()) {
+                throw new IllegalStateException("Can't use Statistic sets with for High resolution metrics");
+            }
+            logger.debug("Using high resolution for cloudwatch metrics");
+        }
 
         if (config.useStatisticsSet()) {
             logger.debug("publishing Timer and DistributionSummary as StatisticsSet");
@@ -110,6 +130,9 @@ public class CloudWatchMeterRegistry extends StepMeterRegistry {
 
     @Override
     protected Timer newTimer(Meter.Id id, DistributionStatisticConfig distributionStatisticConfig, PauseDetector pauseDetector) {
+        if (config.highResolution()) {
+            return new CloudWatchHighResolutionTimer(id, clock);
+        }
         if (config.useStatisticsSet()) {
             Timer timer = new CloudWatchTimer(id, clock, distributionStatisticConfig, pauseDetector, getBaseTimeUnit(),
                     this.config.step().toMillis(), false);
@@ -120,7 +143,26 @@ public class CloudWatchMeterRegistry extends StepMeterRegistry {
     }
 
     @Override
+    protected LongTaskTimer newLongTaskTimer(Meter.Id id, DistributionStatisticConfig distributionStatisticConfig) {
+        if (config.highResolution()) {
+            return new CloudWatchHighResolutionLongTaskTimer(id, clock, TimeUnit.MILLISECONDS);
+        }
+
+        return super.newLongTaskTimer(id, distributionStatisticConfig);
+    }
+
+    @Override
+    protected <T> FunctionTimer newFunctionTimer(Meter.Id id, T obj, ToLongFunction<T> countFunction, ToDoubleFunction<T> totalTimeFunction, TimeUnit totalTimeFunctionUnit) {
+        //TODO: Think about how to make this support high resolution
+        return super.newFunctionTimer(id, obj, countFunction, totalTimeFunction, totalTimeFunctionUnit);
+    }
+
+    @Override
     protected DistributionSummary newDistributionSummary(Meter.Id id, DistributionStatisticConfig distributionStatisticConfig, double scale) {
+        if (config.highResolution()) {
+            logger.warn("Distribution summary not supported for High resolution CloudWatch Registry");
+            return new NoopDistributionSummary(id);
+        }
         if (config.useStatisticsSet()) {
             DistributionSummary summary = new CloudWatchDistributionSummary(id, clock, distributionStatisticConfig, scale,
                     config.step().toMillis(), false);
@@ -193,9 +235,14 @@ public class CloudWatchMeterRegistry extends StepMeterRegistry {
 
         // VisibleForTesting
         Stream<MetricDatum> timerData(Timer timer) {
+            if (config.highResolution()) {
+                final Map<Double, Long> allValuesHistogram = ((CloudWatchHighResolutionTimer) timer).allValuesHistogram();
+                return histogramToValuesArray(allValuesHistogram)
+                        .map(fn -> fn.apply(metricDatumBuilder(timer.getId(), null, toStandardUnit(timer.baseTimeUnit().name()))));
+            }
+
             Stream.Builder<MetricDatum> metrics = Stream.builder();
             long count = timer.count();
-
 
             if (config.useStatisticsSet()) {
                 if (count > 0) {
@@ -218,6 +265,7 @@ public class CloudWatchMeterRegistry extends StepMeterRegistry {
             }
             return metrics.build();
         }
+
 
         // VisibleForTesting
 
@@ -247,6 +295,17 @@ public class CloudWatchMeterRegistry extends StepMeterRegistry {
         }
 
         private Stream<MetricDatum> longTaskTimerData(LongTaskTimer longTaskTimer) {
+            if (config.highResolution()) {
+                Map<Double, Long> allValuesHistogram = new HashMap<>();
+                ((CloudWatchHighResolutionLongTaskTimer) longTaskTimer).forEachActive(sample -> {
+                    final double taskDuration = sample.duration(TimeUnit.MILLISECONDS);
+                    allValuesHistogram.compute(taskDuration, (aDouble, aLong) -> aLong == null ? 0 : aLong + 1);
+
+                });
+                return histogramToValuesArray(allValuesHistogram).map(fn ->
+                        fn.apply(metricDatumBuilder(longTaskTimer.getId(), null, toStandardUnit(longTaskTimer.baseTimeUnit().name())))
+                );
+            }
             return Stream.of(
                     metricDatum(longTaskTimer.getId(), "activeTasks", longTaskTimer.activeTasks()),
                     metricDatum(longTaskTimer.getId(), "duration", longTaskTimer.duration(getBaseTimeUnit())));
@@ -290,7 +349,15 @@ public class CloudWatchMeterRegistry extends StepMeterRegistry {
 
         Stream<MetricDatum> metricData(Meter m) {
             return stream(m.measure().spliterator(), false)
-                    .map(ms -> metricDatum(m.getId().withTag(ms.getStatistic()), ms.getValue()))
+                    .flatMap(ms -> {
+                        if (config.highResolution()) {
+                            Map<Double, Long> allValuesHistogram = new HashMap<>();
+                            m.measure().forEach(measurement -> allValuesHistogram.compute(measurement.getValue(), (aDouble, aLong) -> aLong == null ? 0 : aLong + 1));
+                            return histogramToValuesArray(allValuesHistogram).map(fn ->
+                                    fn.apply(metricDatumBuilder(m.getId().withTag(ms.getStatistic()), null, StandardUnit.NONE)));
+                        }
+                        return Stream.of(metricDatum(m.getId().withTag(ms.getStatistic()), ms.getValue()));
+                    })
                     .filter(Objects::nonNull);
         }
 
@@ -330,7 +397,7 @@ public class CloudWatchMeterRegistry extends StepMeterRegistry {
         private MetricDatum.Builder metricDatumBuilder(Meter.Id id, @Nullable String suffix, StandardUnit standardUnit) {
             List<Tag> tags = id.getConventionTags(config().namingConvention());
             return MetricDatum.builder()
-                    .storageResolution(config.highResolution() ? 1 : 60)
+                    .storageResolution(config.highResolution() ? HIGH_RESOLUTION : 60)
                     .metricName(getMetricName(id, suffix))
                     .dimensions(toDimensions(tags))
                     .timestamp(timestamp)
@@ -366,6 +433,26 @@ public class CloudWatchMeterRegistry extends StepMeterRegistry {
             }
             return true;
         }
+    }
+
+    public static Stream<Function<MetricDatum.Builder, MetricDatum>> histogramToValuesArray(Map<Double, Long> valueCountMap) {
+
+        List<Double> values = new ArrayList<>(valueCountMap.size());
+        List<Double> counts = new ArrayList<>(valueCountMap.size());
+        for (Map.Entry<Double, Long> entry : valueCountMap.entrySet()) {
+            values.add(entry.getKey());
+            counts.add((double) entry.getValue());
+        }
+
+        final Stream.Builder<Function<MetricDatum.Builder, MetricDatum>> streamBuilder = Stream.builder();
+        for (int i = 0; i < valueCountMap.size() / MAX_VALUES_PER_DATUM + (valueCountMap.size() % MAX_VALUES_PER_DATUM == 0 ? 0 : 1); i++) {
+            final List<Double> v = values.subList(i * MAX_VALUES_PER_DATUM, Math.min(values.size(), (i + 1) * MAX_VALUES_PER_DATUM));
+            final List<Double> c = counts.subList(i * MAX_VALUES_PER_DATUM, Math.min(values.size(), (i + 1) * MAX_VALUES_PER_DATUM));
+
+            streamBuilder.add(metricDatumBuilder -> metricDatumBuilder.values(v).counts(c).build());
+        }
+
+        return streamBuilder.build();
     }
 
     @Override
